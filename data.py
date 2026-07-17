@@ -17,6 +17,8 @@ kalau UID mengubah bobot di periode berjalan.
 import streamlit as st
 import uuid
 import datetime
+import json
+import base64
 import pandas as pd
 
 
@@ -548,7 +550,7 @@ def _seed():
                 "fullname": f"Admin {u['name']}",
             }
 
-    st.session_state.db = {
+    db = {
         "units": units,
         "periods": periods,
         "aspects": aspects,
@@ -559,12 +561,12 @@ def _seed():
         "notifications": [],
         "credentials": credentials,  # key: username (lowercase) -> {password, unit_id, fullname}
     }
-    st.session_state.demo_seeded = True
+    return db
 
 
 def authenticate(username: str, password: str):
     """Cek username/password, kembalikan dict user info kalau cocok, None kalau tidak."""
-    creds = st.session_state.db.get("credentials", {})
+    creds = _db().get("credentials", {})
     entry = creds.get((username or "").strip().lower())
     if not entry or entry["password"] != password:
         return None
@@ -581,7 +583,7 @@ def authenticate(username: str, password: str):
 
 def get_all_credentials_list():
     """Untuk ditampilkan di halaman login sebagai referensi (mode prototipe)."""
-    creds = st.session_state.db.get("credentials", {})
+    creds = _db().get("credentials", {})
     rows = []
     for username, entry in creds.items():
         unit = get_unit_by_id(entry["unit_id"])
@@ -594,15 +596,204 @@ def get_all_credentials_list():
     return rows
 
 
+# ---------------------------------------------------------------------------
+# PERSISTENSI SUPABASE (opsional) — kalau secrets Supabase tersedia di
+# .streamlit/secrets.toml, seluruh state di-load dari & disimpan ke Supabase
+# supaya bertahan lintas restart server. Kalau secrets belum di-setup,
+# otomatis fallback ke in-memory saja (perilaku sebelumnya) tanpa error.
+# ---------------------------------------------------------------------------
+
+_SUPABASE_TABLE = "simona_state"
+_SUPABASE_ROW_ID = 1
+
+
+def _get_supabase_client():
+    try:
+        from supabase import create_client
+    except ImportError:
+        return None
+    try:
+        url = st.secrets["SUPABASE_URL"]
+        key = st.secrets["SUPABASE_ANON_KEY"]
+    except Exception:
+        return None
+    if not url or not key:
+        return None
+    try:
+        return create_client(url, key)
+    except Exception:
+        return None
+
+
+def _load_from_supabase():
+    client = _get_supabase_client()
+    if not client:
+        return None
+    try:
+        res = client.table(_SUPABASE_TABLE).select("data").eq("id", _SUPABASE_ROW_ID).execute()
+        if res.data and len(res.data) > 0 and res.data[0].get("data"):
+            raw = res.data[0]["data"]
+            if isinstance(raw, str):
+                raw = json.loads(raw)
+            decoded = _decode_nested(raw)
+            return {
+                "units": decoded["units"],
+                "periods": decoded["periods"],
+                "aspects": decoded["aspects"],
+                "indicators": decoded["indicators"],
+                "weights": {tuple(k): v for k, v in decoded["weights"]},
+                "assessments": {tuple(k): v for k, v in decoded["assessments"]},
+                "reviews": decoded["reviews"],
+                "notifications": decoded["notifications"],
+                "credentials": decoded["credentials"],
+            }
+    except Exception as e:
+        print(f"[SIMONA] Gagal load dari Supabase, fallback ke seed baru: {e}")
+    return None
+
+
+def _save_to_supabase(db: dict):
+    client = _get_supabase_client()
+    if not client:
+        return
+    try:
+        export_obj = {
+            "units": db["units"],
+            "periods": db["periods"],
+            "aspects": db["aspects"],
+            "indicators": db["indicators"],
+            "weights": [[list(k), v] for k, v in db["weights"].items()],
+            "assessments": [[list(k), v] for k, v in db["assessments"].items()],
+            "reviews": db["reviews"],
+            "notifications": db["notifications"],
+            "credentials": db["credentials"],
+        }
+        payload_str = json.dumps(export_obj, default=_json_default, ensure_ascii=False)
+        payload = json.loads(payload_str)  # balik jadi dict/list murni biar bisa dikirim sebagai jsonb
+        client.table(_SUPABASE_TABLE).upsert({
+            "id": _SUPABASE_ROW_ID, "data": payload,
+            "updated_at": datetime.datetime.now().isoformat(),
+        }).execute()
+    except Exception as e:
+        print(f"[SIMONA] Gagal simpan ke Supabase: {e}")
+
+
+def _persist():
+    """Panggil setelah operasi tulis supaya perubahan tersimpan permanen di
+    Supabase (kalau sudah terkonfigurasi). Aman dipanggil walau Supabase
+    belum di-setup — akan diam-diam tidak melakukan apa-apa."""
+    _save_to_supabase(_db())
+
+
+@st.cache_resource(show_spinner=False)
+def _get_shared_db():
+    """
+    Dict database yang di-cache dengan st.cache_resource, sehingga OBJEK YANG
+    SAMA dipakai bersama oleh SEMUA sesi/user yang mengakses app ini pada
+    instance server yang sama — bukan per-browser seperti st.session_state.
+
+    Kalau Supabase sudah dikonfigurasi (lihat _get_supabase_client), state
+    di-load dari sana saat pertama kali dibutuhkan, dan setiap perubahan
+    (lewat _persist()) langsung disimpan balik ke Supabase — sehingga data
+    tetap ada meski server sempat restart/tidur. Kalau Supabase belum
+    dikonfigurasi, otomatis pakai data seed awal yang hanya hidup di memori
+    (hilang kalau server restart, sama seperti sebelumnya).
+    """
+    from_supabase = _load_from_supabase()
+    if from_supabase is not None:
+        return from_supabase
+    db = _seed()
+    _save_to_supabase(db)
+    return db
+
+
+def _db() -> dict:
+    return _get_shared_db()
+
+
 def init_demo_data():
-    if not st.session_state.get("demo_seeded"):
-        _seed()
+    _get_shared_db()
 
 
 def reset_demo_data():
-    st.session_state.pop("db", None)
-    st.session_state.pop("demo_seeded", None)
-    init_demo_data()
+    """Paksa reseed data awal (Juni 2026 real + Juli 2026 kosong), dan timpa
+    Supabase kalau sudah dikonfigurasi — beda dari _get_shared_db() biasa
+    yang akan coba load data lama dari Supabase dulu."""
+    _get_shared_db.clear()
+    fresh_db = _seed()
+    _save_to_supabase(fresh_db)
+    _get_shared_db()  # isi ulang cache dengan data fresh yang baru saja disimpan
+
+
+# ---------------------------------------------------------------------------
+# BACKUP & RESTORE — pengaman kalau server sempat restart/tidur.
+# Karena data disimpan di cache_resource (memory server), data akan hilang
+# kalau proses server-nya benar-benar restart (misal app tidur lama di
+# Streamlit Cloud versi gratis, atau redeploy). Export berkala ke file JSON
+# supaya bisa dipulihkan kalau itu terjadi.
+# ---------------------------------------------------------------------------
+
+def _json_default(o):
+    if isinstance(o, datetime.datetime):
+        return {"__type__": "datetime", "value": o.isoformat()}
+    if isinstance(o, datetime.date):
+        return {"__type__": "date", "value": o.isoformat()}
+    if isinstance(o, bytes):
+        return {"__type__": "bytes", "value": base64.b64encode(o).decode()}
+    raise TypeError(f"Tipe tidak didukung untuk backup: {type(o)}")
+
+
+def _decode_nested(obj):
+    if isinstance(obj, dict):
+        if set(obj.keys()) == {"__type__", "value"}:
+            t = obj["__type__"]
+            if t == "datetime":
+                return datetime.datetime.fromisoformat(obj["value"])
+            if t == "date":
+                return datetime.date.fromisoformat(obj["value"])
+            if t == "bytes":
+                return base64.b64decode(obj["value"])
+        return {k: _decode_nested(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_decode_nested(v) for v in obj]
+    return obj
+
+
+def export_data_json() -> str:
+    """Serialize seluruh database (mode prototipe, in-memory) jadi teks JSON."""
+    db = _db()
+    export_obj = {
+        "units": db["units"],
+        "periods": db["periods"],
+        "aspects": db["aspects"],
+        "indicators": db["indicators"],
+        "weights": [[list(k), v] for k, v in db["weights"].items()],
+        "assessments": [[list(k), v] for k, v in db["assessments"].items()],
+        "reviews": db["reviews"],
+        "notifications": db["notifications"],
+        "credentials": db["credentials"],
+        "exported_at": datetime.datetime.now().isoformat(),
+    }
+    return json.dumps(export_obj, default=_json_default, ensure_ascii=False, indent=2)
+
+
+def import_data_json(json_str: str):
+    """Timpa seluruh database dengan isi file backup JSON. Berlaku untuk semua
+    user yang sedang pakai app ini (karena datanya shared/cache_resource)."""
+    raw = json.loads(json_str)
+    raw = _decode_nested(raw)
+    db = _db()
+    db.clear()
+    db["units"] = raw["units"]
+    db["periods"] = raw["periods"]
+    db["aspects"] = raw["aspects"]
+    db["indicators"] = raw["indicators"]
+    db["weights"] = {tuple(k): v for k, v in raw["weights"]}
+    db["assessments"] = {tuple(k): v for k, v in raw["assessments"]}
+    db["reviews"] = raw["reviews"]
+    db["notifications"] = raw["notifications"]
+    db["credentials"] = raw["credentials"]
+    _persist()
 
 
 # ---------------------------------------------------------------------------
@@ -610,57 +801,60 @@ def reset_demo_data():
 # ---------------------------------------------------------------------------
 
 def get_units(unit_type: str | None = None) -> pd.DataFrame:
-    df = pd.DataFrame(st.session_state.db["units"])
+    df = pd.DataFrame(_db()["units"])
     if unit_type:
         df = df[df["type"] == unit_type]
     return df
 
 
 def get_unit_by_id(unit_id: str) -> dict | None:
-    for u in st.session_state.db["units"]:
+    for u in _db()["units"]:
         if u["id"] == unit_id:
             return u
     return None
 
 
 def get_child_units(parent_id: str) -> pd.DataFrame:
-    df = pd.DataFrame(st.session_state.db["units"])
+    df = pd.DataFrame(_db()["units"])
     if df.empty:
         return df
     return df[df["parent_id"] == parent_id]
 
 
 def get_periods() -> pd.DataFrame:
-    return pd.DataFrame(st.session_state.db["periods"])
+    return pd.DataFrame(_db()["periods"])
 
 
 def add_period(month, year, submission_deadline, review_deadline):
     new_id = _new_id()
-    st.session_state.db["periods"].append({
+    _db()["periods"].append({
         "id": new_id, "month": month, "year": year, "status": "OPEN",
         "submission_deadline": submission_deadline, "review_deadline": review_deadline,
     })
     # otomatis salin bobot aspek dari periode terakhir supaya tidak mulai dari nol
-    existing_periods = [p for p in st.session_state.db["periods"] if p["id"] != new_id]
+    existing_periods = [p for p in _db()["periods"] if p["id"] != new_id]
     if existing_periods:
         latest = existing_periods[-1]
-        for a in st.session_state.db["aspects"]:
-            w = st.session_state.db["weights"].get((latest["id"], a["id"]))
+        for a in _db()["aspects"]:
+            w = _db()["weights"].get((latest["id"], a["id"]))
             if w is not None:
-                st.session_state.db["weights"][(new_id, a["id"])] = w
+                _db()["weights"][(new_id, a["id"])] = w
+    _persist()
     return new_id
 
 
 def lock_period(period_id: str):
-    for p in st.session_state.db["periods"]:
+    for p in _db()["periods"]:
         if p["id"] == period_id:
             p["status"] = "LOCKED"
+    _persist()
 
 
 def add_unit(name, unit_type, parent_id):
-    st.session_state.db["units"].append({
+    _db()["units"].append({
         "id": _new_id(), "name": name, "type": unit_type, "parent_id": parent_id,
     })
+    _persist()
 
 
 # ---------------------------------------------------------------------------
@@ -668,18 +862,19 @@ def add_unit(name, unit_type, parent_id):
 # ---------------------------------------------------------------------------
 
 def get_aspects(unit_type: str | None = None) -> pd.DataFrame:
-    df = pd.DataFrame(st.session_state.db["aspects"])
+    df = pd.DataFrame(_db()["aspects"])
     if unit_type and not df.empty:
         df = df[df["unit_type"] == unit_type]
     return df
 
 
 def add_aspect(name, unit_type="UP3"):
-    st.session_state.db["aspects"].append({"id": _new_id(), "name": name, "unit_type": unit_type})
+    _db()["aspects"].append({"id": _new_id(), "name": name, "unit_type": unit_type})
+    _persist()
 
 
 def get_indicators(aspect_id: str | None = None) -> list[dict]:
-    inds = st.session_state.db["indicators"]
+    inds = _db()["indicators"]
     if aspect_id:
         inds = [i for i in inds if i["aspect_id"] == aspect_id]
     return inds
@@ -687,34 +882,37 @@ def get_indicators(aspect_id: str | None = None) -> list[dict]:
 
 def get_indicators_for_unit_type(unit_type: str) -> list[dict]:
     """Semua indikator (lintas aspek) yang berlaku untuk tipe unit tertentu (UP3/ULP)."""
-    aspect_ids = {a["id"] for a in st.session_state.db["aspects"] if a["unit_type"] == unit_type}
-    return [i for i in st.session_state.db["indicators"] if i["aspect_id"] in aspect_ids]
+    aspect_ids = {a["id"] for a in _db()["aspects"] if a["unit_type"] == unit_type}
+    return [i for i in _db()["indicators"] if i["aspect_id"] in aspect_ids]
 
 
 def add_indicator(aspect_id, name, maximum_score=5):
-    st.session_state.db["indicators"].append({
+    _db()["indicators"].append({
         "id": _new_id(), "aspect_id": aspect_id, "name": name,
         "maximum_score": maximum_score, "levels": [],
     })
+    _persist()
 
 
 def add_level(indicator_id, level, label, score=None):
-    for ind in st.session_state.db["indicators"]:
+    for ind in _db()["indicators"]:
         if ind["id"] == indicator_id:
             ind["levels"] = [lv for lv in ind["levels"] if lv["level"] != level]
             ind["levels"].append({"level": level, "level_label": label, "score": score if score is not None else level})
             ind["levels"].sort(key=lambda x: x["level"])
+    _persist()
 
 
 def get_aspect_weight(period_id, aspect_id) -> float:
-    return st.session_state.db["weights"].get((period_id, aspect_id), 0.0)
+    return _db()["weights"].get((period_id, aspect_id), 0.0)
 
 
 def set_aspect_weight(period_id, aspect_id, bobot):
-    period = next((p for p in st.session_state.db["periods"] if p["id"] == period_id), None)
+    period = next((p for p in _db()["periods"] if p["id"] == period_id), None)
     if period and period["status"] == "LOCKED":
         raise ValueError("Periode sudah LOCKED, bobot aspek tidak bisa diubah.")
-    st.session_state.db["weights"][(period_id, aspect_id)] = bobot
+    _db()["weights"][(period_id, aspect_id)] = bobot
+    _persist()
 
 
 # ---------------------------------------------------------------------------
@@ -726,12 +924,12 @@ def _akey(unit_id, period_id, indicator_id):
 
 
 def get_assessment(unit_id, period_id, indicator_id) -> dict | None:
-    return st.session_state.db["assessments"].get(_akey(unit_id, period_id, indicator_id))
+    return _db()["assessments"].get(_akey(unit_id, period_id, indicator_id))
 
 
 def get_assessments_for_unit(unit_id, period_id) -> list[dict]:
     out = []
-    for (u, p, i), val in st.session_state.db["assessments"].items():
+    for (u, p, i), val in _db()["assessments"].items():
         if u == unit_id and p == period_id:
             out.append({**val, "unit_id": u, "period_id": p, "indicator_id": i})
     return out
@@ -739,14 +937,14 @@ def get_assessments_for_unit(unit_id, period_id) -> list[dict]:
 
 def get_assessments_for_units(unit_ids, period_id) -> list[dict]:
     out = []
-    for (u, p, i), val in st.session_state.db["assessments"].items():
+    for (u, p, i), val in _db()["assessments"].items():
         if u in unit_ids and p == period_id:
             out.append({**val, "unit_id": u, "period_id": p, "indicator_id": i})
     return out
 
 
 def _count_indicators_in_aspect(aspect_id) -> int:
-    return len([i for i in st.session_state.db["indicators"] if i["aspect_id"] == aspect_id])
+    return len([i for i in _db()["indicators"] if i["aspect_id"] == aspect_id])
 
 
 def _indicator_nilai(period_id, indicator_id, level) -> float | None:
@@ -755,7 +953,7 @@ def _indicator_nilai(period_id, indicator_id, level) -> float | None:
     MaxLevel otomatis mengikuti skala indikator (5 untuk UP3, 3 untuk ULP)."""
     if level is None:
         return None
-    ind = next((i for i in st.session_state.db["indicators"] if i["id"] == indicator_id), None)
+    ind = next((i for i in _db()["indicators"] if i["id"] == indicator_id), None)
     if not ind:
         return None
     bobot_aspek = get_aspect_weight(period_id, ind["aspect_id"])
@@ -768,10 +966,10 @@ def _indicator_nilai(period_id, indicator_id, level) -> float | None:
 
 def save_draft(unit_id, period_id, indicator_id, level, notes, filled_by):
     key = _akey(unit_id, period_id, indicator_id)
-    existing = st.session_state.db["assessments"].get(key, {})
+    existing = _db()["assessments"].get(key, {})
     nilai = _indicator_nilai(period_id, indicator_id, level)
 
-    st.session_state.db["assessments"][key] = {
+    _db()["assessments"][key] = {
         **existing,
         "level": level, "score": nilai, "notes": notes,
         "status": existing.get("status", "DRAFT")
@@ -780,11 +978,12 @@ def save_draft(unit_id, period_id, indicator_id, level, notes, filled_by):
         "evidences": existing.get("evidences", []),
         "updated_at": datetime.datetime.now(),
     }
+    _persist()
 
 
 def submit_unit_assessments(unit_id, period_id, submitted_by):
     count = 0
-    for key, val in st.session_state.db["assessments"].items():
+    for key, val in _db()["assessments"].items():
         u, p, _ = key
         if u == unit_id and p == period_id and val["status"] in ("DRAFT", "REVISION"):
             val["status"] = "SUBMITTED"
@@ -798,64 +997,18 @@ def submit_unit_assessments(unit_id, period_id, submitted_by):
             message=f"{get_unit_by_id(unit_id)['name']} mengirim {count} indikator untuk periode ini.",
             n_type="SUBMISSION_RECEIVED",
         )
+    _persist()
     return count
-
-
-def update_assessment_by_uid(unit_id, period_id, indicator_id, level, notes, reviewer, edit_reason=""):
-    """Edit nilai/catatan assessment yang sudah dikirim oleh unit.
-
-    Status SUBMITTED otomatis menjadi IN_REVIEW. Status APPROVED tetap APPROVED
-    agar koreksi UID langsung tercermin pada nilai final. Setiap perubahan dicatat
-    dalam riwayat review dan dikirimkan sebagai notifikasi ke unit terkait.
-    """
-    key = _akey(unit_id, period_id, indicator_id)
-    val = st.session_state.db["assessments"].get(key)
-    if not val:
-        return False
-    if val.get("status") not in ("SUBMITTED", "IN_REVIEW", "APPROVED"):
-        return False
-
-    old_level = val.get("level")
-    old_notes = val.get("notes", "")
-    old_status = val.get("status", "SUBMITTED")
-
-    val["level"] = level
-    val["score"] = _indicator_nilai(period_id, indicator_id, level)
-    val["notes"] = notes
-    val["edited_by_uid"] = reviewer
-    val["edited_at"] = datetime.datetime.now()
-    val["updated_at"] = datetime.datetime.now()
-    if old_status == "SUBMITTED":
-        val["status"] = "IN_REVIEW"
-
-    detail = f"Level {old_level} → {level}."
-    if old_notes != notes:
-        detail += " Catatan assessment diperbarui."
-    if edit_reason.strip():
-        detail += f" Alasan: {edit_reason.strip()}"
-
-    st.session_state.db["reviews"].append({
-        "unit_id": unit_id, "period_id": period_id, "indicator_id": indicator_id,
-        "decision": "EDIT_BY_UID", "comments": detail, "reviewer": reviewer,
-        "time": datetime.datetime.now(),
-    })
-    add_notification(
-        target_unit_id=unit_id,
-        title="Assessment diperbarui oleh UID",
-        message=f"{reviewer} memperbarui data assessment. {detail}",
-        n_type="UID_EDIT",
-    )
-    return True
 
 
 def approve_assessment(unit_id, period_id, indicator_id, reviewer, comments):
     key = _akey(unit_id, period_id, indicator_id)
-    val = st.session_state.db["assessments"].get(key)
+    val = _db()["assessments"].get(key)
     if val:
         val["status"] = "APPROVED"
         val["approved_by"] = reviewer
         val["approved_at"] = datetime.datetime.now()
-    st.session_state.db["reviews"].append({
+    _db()["reviews"].append({
         "unit_id": unit_id, "period_id": period_id, "indicator_id": indicator_id,
         "decision": "APPROVE", "comments": comments, "reviewer": reviewer,
         "time": datetime.datetime.now(),
@@ -866,15 +1019,16 @@ def approve_assessment(unit_id, period_id, indicator_id, reviewer, comments):
         message=f"Indikator disetujui oleh {reviewer}.",
         n_type="APPROVAL",
     )
+    _persist()
 
 
 def request_revision(unit_id, period_id, indicator_id, reviewer, comments):
     key = _akey(unit_id, period_id, indicator_id)
-    val = st.session_state.db["assessments"].get(key)
+    val = _db()["assessments"].get(key)
     if val:
         val["status"] = "REVISION"
         val["revision_count"] = val.get("revision_count", 0) + 1
-    st.session_state.db["reviews"].append({
+    _db()["reviews"].append({
         "unit_id": unit_id, "period_id": period_id, "indicator_id": indicator_id,
         "decision": "REQUEST_REVISION", "comments": comments, "reviewer": reviewer,
         "time": datetime.datetime.now(),
@@ -885,11 +1039,12 @@ def request_revision(unit_id, period_id, indicator_id, reviewer, comments):
         message=comments,
         n_type="REVISION_REQUEST",
     )
+    _persist()
 
 
 def get_reviews_for(unit_id, period_id, indicator_id) -> list[dict]:
     return [
-        r for r in st.session_state.db["reviews"]
+        r for r in _db()["reviews"]
         if r["unit_id"] == unit_id and r["period_id"] == period_id and r["indicator_id"] == indicator_id
     ]
 
@@ -900,7 +1055,7 @@ def get_reviews_for(unit_id, period_id, indicator_id) -> list[dict]:
 
 def add_evidence(unit_id, period_id, indicator_id, filename, uploaded_by, file_bytes=None, mime_type=None):
     key = _akey(unit_id, period_id, indicator_id)
-    val = st.session_state.db["assessments"].setdefault(key, {
+    val = _db()["assessments"].setdefault(key, {
         "level": None, "score": None, "notes": "", "status": "DRAFT",
         "filled_by": uploaded_by, "evidences": [],
     })
@@ -910,6 +1065,7 @@ def add_evidence(unit_id, period_id, indicator_id, filename, uploaded_by, file_b
         "file_bytes": file_bytes,
         "mime_type": mime_type,
     })
+    _persist()
 
 
 # ---------------------------------------------------------------------------
@@ -946,7 +1102,7 @@ def compute_aspect_scores(unit_id, period_id) -> pd.DataFrame:
     unit = get_unit_by_id(unit_id)
     unit_type = unit["type"] if unit else "UP3"
     rows = []
-    for aspect in st.session_state.db["aspects"]:
+    for aspect in _db()["aspects"]:
         if aspect["unit_type"] != unit_type:
             continue
         inds = get_indicators(aspect["id"])
@@ -989,7 +1145,7 @@ def compute_evidence_completion(unit_id, period_id) -> float:
 # ---------------------------------------------------------------------------
 
 def add_notification(title, message, n_type, target_unit_id=None, target_role=None):
-    st.session_state.db["notifications"].append({
+    _db()["notifications"].append({
         "id": _new_id(), "title": title, "message": message, "type": n_type,
         "target_unit_id": target_unit_id, "target_role": target_role,
         "is_read": False, "created_at": datetime.datetime.now(),
@@ -998,7 +1154,7 @@ def add_notification(title, message, n_type, target_unit_id=None, target_role=No
 
 def get_notifications_for(role, unit_id) -> list[dict]:
     out = []
-    for n in st.session_state.db["notifications"]:
+    for n in _db()["notifications"]:
         if n.get("target_role") == role or n.get("target_unit_id") == unit_id:
             out.append(n)
     return sorted(out, key=lambda x: x["created_at"], reverse=True)

@@ -1,6 +1,6 @@
 import streamlit as st
 from data import init_demo_data
-from ui import get_favicon, inject_global_style
+from ui import get_favicon
 
 st.set_page_config(
     page_title="SIMONA - Maturity Level Gudang Distribusi UID Banten",
@@ -9,8 +9,6 @@ st.set_page_config(
 )
 
 init_demo_data()
-inject_global_style()
-
 role = st.session_state.get("role")
 authenticated = st.session_state.get("is_authenticated", False)
 
